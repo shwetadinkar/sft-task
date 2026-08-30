@@ -1,0 +1,64 @@
+{
+  "conversations": [
+    {
+      "id": "f-01",
+      "turns": [
+        {
+          "role": "user",
+          "text": "invoice export session"
+        },
+        {
+          "role": "user",
+          "text": "token retry"
+        }
+      ]
+    },
+    {
+      "id": "f-02",
+      "turns": [
+        {
+          "role": "user",
+          "text": "retry billing"
+        },
+        {
+          "role": "assistant",
+          "text": "webhook timeout workspace"
+        }
+      ]
+    },
+    {
+      "id": "f-03",
+      "turns": [
+        {
+          "role": "user",
+          "text": "workspace seat quota sandbox"
+        },
+        {
+          "role": "user",
+          "text": "sandbox digest rollback"
+        }
+      ]
+    },
+    {
+      "id": "f-04",
+      "turns": [
+        {
+          "role": "user",
+          "text": "digest rollback region"
+        },
+        {
+          "role": "assistant",
+          "text": "sync credential"
+        }
+      ]
+    }
+  ],
+  "config": {
+    "max_seq_len": 32,
+    "max_tokens_per_microbatch": 64,
+    "grad_accum_steps": 1,
+    "base_lr": 0.0002,
+    "min_lr": 1e-05,
+    "warmup_steps": 0
+  }
+}

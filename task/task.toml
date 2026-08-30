@@ -1,0 +1,229 @@
+artifacts = [
+  "/app/sfttrainer/pipeline.py",
+  "/app/sfttrainer/batching.py",
+  "/app/sfttrainer/schedule.py",
+  "/app/sfttrainer/tokenizer.py",
+  "/app/sfttrainer/__init__.py",
+  "/app/repro.py",
+]
+
+[task]
+name = "dynamo/repair-sft-trainer"
+description = "Repair a supervised fine-tuning data pipeline so it conforms to its normative specification, not merely to its shipped smoke test."
+
+[metadata]
+# --- Pre-seeded for you when this repo was created — DO NOT EDIT ---
+category = "Model Training and ML Infrastructure"
+subcategory = "Fine tuning"
+# --- Fixed for this dataset — LEAVE AS-IS ---
+model_tested = "Opus-4.8"
+agent_tested = "Terminus-2"
+# --- You fill these in ---
+task_objective = ["debug", "fix"]
+artifact_type = ["codebase"]
+expert_time_estimate_hours = 3
+difficulty_explanation = """
+The package under repair turns multi-turn conversations into optimizer-step-ready
+micro-batches for supervised fine-tuning: it renders conversations to token sequences,
+marks which positions carry loss, clips over-long examples, packs examples into padded
+micro-batches under a token budget, and normalizes per-micro-batch loss weights for
+gradient accumulation. `SPEC.md`, shipped alongside it, is the normative statement of all
+of that behaviour.
+
+The package violates the specification in four places. One violation crashes the shipped
+reproduction immediately: the packing routine omits the candidate example's own width
+from its capacity test, so a micro-batch overruns its padded token budget as soon as a
+longer example follows shorter ones. The other three are latent under the shipped
+fixtures and produce no error, no warning, and no shape mismatch:
+
+  * only the final assistant turn of a conversation is supervised, so every earlier
+    assistant turn is silently excluded from the loss;
+  * over-long examples keep the tail of the token array but the head of the mask array,
+    desynchronising labels from tokens while both arrays remain the correct length;
+  * the accumulation loss weight divides by the number of micro-batches in the optimizer
+    step rather than by the step's total supervised token count.
+
+Each is invisible because of what the fixtures are, not because of what they hide. The
+shipped conversations are single-turn, so there is never an earlier assistant turn to
+drop. They fall under the sequence limit, so truncation never runs. They are
+length-uniform, so the two normalization formulas coincide exactly. The fixtures are an
+entirely reasonable smoke test; they simply do not span the specification.
+
+The difficulty is therefore not in any single fix — each is a few lines — but in
+recognising that the reported crash is a symptom rather than the requirement. The
+specification, not the traceback, defines what "correct" means, and conformance has to be
+established by reading all three in-scope modules against it. The natural agent
+behaviour, repairing the visible failure and confirming the smoke test now passes, leaves
+three violations in place. One of the three modules is already correct, so the audit
+cannot be reduced to "find one bug per file" either.
+
+The expertise required is practical familiarity with SFT data preparation: how
+supervision masks are laid out across multi-turn chat transcripts, why token and label
+arrays must be clipped by the same rule, and why gradient accumulation must normalize by
+supervised tokens rather than by micro-batch count when micro-batches are ragged. All
+three are well-documented sources of silently degraded fine-tuning runs — they do not
+crash, they just train on less signal than intended or weight it wrongly, and they are
+usually caught only by someone auditing a pipeline against its spec.
+
+All data is synthetic and authored for this task: short support-desk exchanges whose word
+counts are chosen so that rendered lengths, packing widths, and supervised-token totals
+are exact and hand-checkable. The workload is deliberately tiny — numpy only, one CPU,
+no model weights — so that the difficulty is entirely in the reasoning rather than in
+compute.
+
+Establishing conformance is not a reading exercise. The specification states roughly
+thirty separate rules across six sections, and all three in-scope modules are plausible
+code that passes the shipped smoke test; deciding by inspection which rules are violated,
+and being confident none were missed, is not a judgement a practitioner would rely on.
+The work is to construct inputs outside the fixture distribution — conversations with
+several assistant turns, examples that exceed the sequence limit while retaining
+supervision inside the surviving prefix, optimizer steps whose micro-batches carry
+unequal supervised token counts — and run the package on them against what the
+specification requires. Each probe has to be derived from a specification rule, executed,
+and its output compared with a hand-derived expectation. A badly shaped probe is not
+merely uninformative but actively misleading: an over-long example whose supervision
+falls entirely outside the retained prefix is dropped under §6 by both a conforming and a
+non-conforming implementation, so it returns identical output and reads as evidence of
+correctness. Since one of the three in-scope modules is already correct, there is no
+per-file quota to exploit either.
+
+The accumulation-normalization defect resembles a class of gradient-accumulation errors
+that has been discussed publicly, and a solver may recognise it on sight. That is
+intended rather than a weakness: it is one of four defects, the other three are specific
+to this pipeline's masking and truncation rules, and recognising one does not locate the
+others.
+
+In the real world this is the work of an ML infrastructure or applied-research engineer
+who owns an in-house fine-tuning data pipeline and has to certify it against a written
+spec before a training run, or who is investigating why a fine-tune underperformed
+despite a green test suite.
+"""
+solution_explanation = """
+Starting from the instruction alone, the priors are: `SPEC.md` is normative, conformance
+is required for every input the specification admits, and the shipped reproduction
+currently fails.
+
+Run `/app/repro.py` first. It raises on a micro-batch whose padded size exceeds the
+budget, which localises the first defect to the packing routine in
+`sfttrainer/batching.py`. SPEC §7 gives the capacity test explicitly as
+`(n + 1) * max(Lmax, Lc) <= max_tokens_per_microbatch`; the implementation tests against
+the running maximum of the members already admitted, excluding the candidate's own
+length. Because §7 packs in ascending length order, the candidate is always at least as
+long as the members, so the omission always under-estimates the resulting width. Include
+the candidate's length in the maximum and the reproduction passes.
+
+At that point the smoke test is green, and the actual work begins: the instruction asks
+for conformance to the specification, and the fixtures exercise only a fraction of it.
+Reading the three in-scope modules against `SPEC.md` section by section turns up three
+further divergences, all in `sfttrainer/pipeline.py`.
+
+§5 defines supervision as a property of each position: a position is supervised if and
+only if it is a content token of an assistant turn, or the `<end>` closing an assistant
+turn. The implementation first scans for the index of the last assistant turn and
+supervises only that one. On the single-turn fixtures the last assistant turn is the only
+assistant turn, so the two readings agree; on any conversation with two or more
+exchanges, the implementation drops all supervision except the final answer. The fix is
+to derive `supervised` from the turn's role rather than from its position.
+
+§6 requires that an over-long example be clipped to the *first* `max_seq_len` entries of
+both arrays. The implementation slices the token array from the end and the mask array
+from the front. Both arrays come out the correct length, so nothing downstream complains,
+but every label is now attached to the wrong token. The shipped fixtures all fall under
+the limit, so the branch never executes. The fix is to slice both from the front.
+
+§8 defines the accumulation weight as the micro-batch's supervised token count over the
+step's supervised token total. The implementation returns `1 / len(step)`. These are
+equal exactly when every micro-batch in the step carries the same number of supervised
+tokens, which is true of the length-uniform fixtures and false in general. The fix is to
+sum the supervised positions across the step and divide.
+
+`sfttrainer/schedule.py` already conforms to §10 and needs no change; confirming that is
+part of the audit rather than a step that produces an edit.
+
+`solution/solve.sh` installs the two repaired modules over the shipped ones and re-runs
+the reproduction. The repaired sources are kept as files in `solution/` rather than
+inlined as heredocs.
+"""
+verification_explanation = """
+The instruction states one requirement — `/app/sfttrainer` must conform to `/app/SPEC.md`
+for every input the specification admits — and every test grades that requirement against
+a numbered section of the specification.
+
+Ground truth is `tests/reference.py`, an independent implementation of `SPEC.md`. It was
+written from the specification alone by an author with no access to the package under
+repair, to the oracle solution, or to any description of the defects, precisely so that a
+misreading of the specification cannot be shared between the thing being graded and the
+thing grading it. It depends only on numpy and the standard library, imports no project
+module, and each of its functions maps onto a numbered section. Expected values are
+computed by calling it at verify time; nothing is frozen to disk or hardcoded, so the
+derivation of every expected value is readable in full.
+
+Verification runs over ten held-out panels in `tests/panels/`. Panels are overlaid at
+`/tests` at verify time only and are never copied into the environment image, so the
+agent cannot read, tune against, or special-case them. They cover: assembly and masking
+of single-turn and multi-turn conversations including a trailing unsupervised user turn
+(§5); truncation with supervision surviving inside the retained prefix, truncation
+cutting into a later turn, and the drop rule for examples left with no supervision (§6);
+packing at exact budget equality and across a jump in example width (§7); an optimizer
+step spanning micro-batches with unequal supervised token counts (§8); and a schedule
+spanning both the warmup and cosine branches (§10).
+
+Six of the ten panels distinguish the shipped package from a conforming one. The other
+four — baseline assembly, the drop rule, the packing boundary, and the schedule — pin
+specification rules that the shipped defects happen to satisfy; they are retained because
+a solver who rewrites a module rather than patching it can regress them, which keeps the
+suite grading conformance rather than the presence of four particular edits.
+
+Sixteen test functions, two of them parametrized across all ten panels, give 35 cases.
+Each function carries a docstring naming the section it enforces. The package is executed
+in an isolated child process with `/app` as its only path entry and communicates by JSON
+on stdout; it is never imported into the pytest process, so agent code cannot reach the
+reference implementation, the panels, or the test framework. Behaviour is verified by
+running the package and comparing its outputs — no test inspects source text.
+
+Integer arrays (tokens, masks, shapes, example ids, micro-batch composition) are compared
+for exact equality, since the specification determines them exactly and no legitimate
+implementation variation exists.
+
+Only two outputs are compared with a tolerance: loss weights (§8) and learning rates
+(§10), both float64, at `rel=1e-7`. The band brackets the difference between two correct
+implementations of the same formula. Its only legitimate source of variation is summation
+order in the reductions: the reference accumulates each step's supervised token total
+with `math.fsum` while a conforming implementation may use any summation, and the cosine
+term is evaluated from the same inputs by both. For the magnitudes involved that drift is
+on the order of 1e-16 relative, so 1e-7 sits roughly nine orders of magnitude above the
+noise it must absorb. It is simultaneously far tighter than any behavioural error: the
+micro-batch-count normalization returns 0.5 where the specification requires 0.2308 on
+the ragged panel, a factor-of-two error that the band rejects by six orders of magnitude.
+The calibration has been checked against an alternative correct implementation rather
+than against the oracle alone — the reference and the repaired package agree to exact
+equality on all ten panels, including full token and mask arrays — so the band is not one
+that only the reference solution can hit.
+
+One artefact of §10 is worth recording so it is not mistaken for an off-by-one: at
+`t = W - 1` the warmup branch returns exactly `base_lr`, and at `t = W` the cosine branch
+begins at progress 0, which is also `base_lr`. The peak is therefore held across the
+warmup/decay seam, which is visible in the schedule panel as two consecutive steps at the
+peak rate. This follows directly from the formula as written in §10 and both
+implementations reproduce it independently.
+
+The suite is deterministic: no randomness, no network access, no wall-clock or filesystem
+ordering dependence, and all dependencies are pinned in the environment image. Against
+the shipped package 10 cases fail; against a package where only the crashing defect is
+repaired 5 cases still fail; against the oracle all 35 pass.
+"""
+
+[verifier]
+timeout_sec = 120.0
+
+[agent]
+timeout_sec = 2400.0
+
+[environment]
+build_timeout_sec = 600.0
+cpus = 1
+memory_mb = 2048
+storage_mb = 10240
+gpus = 0
+allow_internet = true
+mcp_servers = []
